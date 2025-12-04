@@ -1,0 +1,149 @@
+# Sample severity scores from CNN (0-10)
+severity_score_cnn <- runif(5, min = 0, max = 10)
+
+# Load dataset
+treatment_data <- read.csv("mental_health_diagnosis_treatment_.csv")
+
+# Data Cleaning (Keep the columns that we need)
+cleaned_df <- treatment_data[, c("Patient.ID",
+                                 "Symptom.Severity..1.10.",
+                                 "Therapy.Type",
+                                 "Outcome")]
+
+colnames(cleaned_df) <- c("patient","severity","therapy","outcome")
+
+# Convert outcomes to ratings (Improved=1, No Change=0, Deteriorated=-1)
+cleaned_df$rating <- ifelse(cleaned_df$outcome == "Improved", 1,
+                            ifelse(cleaned_df$outcome == "No Change", 0, -1))
+
+
+# Create the therapy matrix (user-item matrix: a matrix of patient by therapy with their outcome rating)
+therapy_table <- xtabs(rating ~ patient + therapy, data = cleaned_df)
+therapy_matrix <- as.matrix(therapy_table)
+
+# Set up patient feature for later similarity calculation
+
+# Extract the severity scores from patients
+patient_severity_df <- treatment_data[!duplicated(treatment_data$Patient.ID),
+                                      c("Patient.ID","Symptom.Severity..1.10.")]
+colnames(patient_severity_df) <- c("patient","severity")
+rownames(patient_severity_df) <- patient_severity_df$patient
+patient_severity_df <- patient_severity_df[rownames(therapy_matrix), , drop=FALSE]
+severity_vector <- patient_severity_df$severity
+
+# Get the other numeric features
+feature_df <- treatment_data[!duplicated(treatment_data$Patient.ID),
+                             c("Patient.ID",
+                               "Age",
+                               "Mood.Score..1.10.",
+                               "Sleep.Quality..1.10.",
+                               "Physical.Activity..hrs.week.",
+                               "Stress.Level..1.10.",
+                               "Treatment.Progress..1.10.",
+                               "Adherence.to.Treatment....")]
+
+rownames(feature_df) <- feature_df$Patient.ID
+feature_df <- feature_df[rownames(therapy_matrix), , drop=FALSE]
+patient_features <- feature_df[, -1] 
+
+# Scale the feature value
+patient_features_scaled <- scale(patient_features)
+
+
+# Cosine similarity
+library(lsa)
+
+# Similarity (patient_features)
+sim_feature <- cosine(t(patient_features_scaled))
+diag(sim_feature) <- NA  
+
+# Similarity (therapy_matrix)
+therapy_scaled <- scale(therapy_matrix, scale = FALSE)
+sim_therapy <- cosine(t(therapy_scaled))
+diag(sim_therapy) <- NA
+
+
+# Combination of feature and therapy
+w_feature <- 0.6
+w_therapy <- 0.4
+sim_hybrid <- w_feature * sim_feature + w_therapy * sim_therapy
+
+# Min–max Scale
+sim_hybrid_scaled <- apply(sim_hybrid, 2, function(x){
+  (x - min(x, na.rm=TRUE)) / (max(x, na.rm=TRUE) - min(x, na.rm=TRUE))
+})
+
+
+# Create the recommend_therapy function
+recommend_therapy <- function(severity_score_cnn,
+                              severity_vector,
+                              therapy_matrix,
+                              sim_hybrid_scaled,
+                              k = 5) {
+  
+  # If severity score is 0, which means no need for treatment
+  if (severity_score_cnn == 0) {
+    return(list(
+      severity_score_cnn = severity_score_cnn,
+      best_therapy = "No treatment needed"
+    ))
+  }
+  
+  # Find the closed patient based on severity
+  distance <- abs(severity_vector - severity_score_cnn)
+  anchor_idx <- which.min(distance)
+  
+  sims <- sim_hybrid_scaled[, anchor_idx]
+  sims_clean <- sims[!is.na(sims)]
+  
+  # It's for if there is no similar patients, return "No similar patients found"
+  if (length(sims_clean) == 0) {
+    return(list(
+      severity_score_cnn = severity_score_cnn,
+      best_therapy = "No similar patients found"
+    ))
+  }
+  
+  # Find the most similar patients k
+  k <- min(k, length(sims_clean))
+  top_idx <- order(sims_clean, decreasing=TRUE)[1:k]
+  valid_positions <- which(!is.na(sims))
+  idx_neighbor <- valid_positions[top_idx]
+  
+  # Take the therapy results from patients
+  sub_matrix <- therapy_matrix[idx_neighbor, , drop=FALSE]
+  w <- sims[idx_neighbor]
+  
+  # Weighted average to predictions
+  # Only use the "Improved" Outcome Rating
+  pred_ratings <- apply(sub_matrix, 2, function(col){
+    improved_only <- ifelse(col == 1, 1, NA)
+    if (all(is.na(improved_only))) return(NA)
+    sum((col == 1) * w, na.rm=TRUE) / sum(w, na.rm=TRUE)
+  })
+
+  # If there is nothing found, get back to the most successful therapy
+  if (all(is.na(pred_ratings))) {
+    num_improved <- tapply(cleaned_df$rating == 1, cleaned_df$therapy, sum)
+    best_therapy <- names(num_improved)[which.max(num_improved)]
+  } else {
+    best_therapy <- names(pred_ratings)[which.max(pred_ratings)]
+  }
+  
+  list(
+    severity_score_cnn = severity_score_cnn,
+    idx_neighbor = idx_neighbor,
+    pred_ratings = pred_ratings,
+    best_therapy = best_therapy
+  )
+}
+
+
+# Try to run this recommendations system
+output <- lapply(severity_score_cnn, function(sv){
+  recommend_therapy(sv,
+                    severity_vector,
+                    therapy_matrix,
+                    sim_hybrid_scaled,
+                    k = 8)
+})
